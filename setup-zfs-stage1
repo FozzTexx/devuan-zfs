@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import re
+import subprocess
+from dataclasses import dataclass
+import time
+import tempfile
+
+# I found "root" and "boot" were too similar and difficult to
+# disnguish at a glance so I prefer to call the root pool "main"
+
+DISK_BY_ID = "/dev/disk/by-id"
+MNT = "/mnt"
+
+def build_argparser():
+  parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+  parser.add_argument("disk", nargs="+", help="devices to use for disks or missing")
+  parser.add_argument("--efi-size", default="512M", help="size of EFI partition")
+  parser.add_argument("--boot-size", default="1G", help="size of /boot partition")
+  parser.add_argument("--boot-pool", default="boot", help="name of boot pool")
+  parser.add_argument("--main-pool", default="main", help="name of main pool")
+  parser.add_argument("--raid-level", default="raidz2", help="raid level of main pool")
+  parser.add_argument("--prefer-wwn", action="store_true", help="prefer /dev/disk/by-id/wwn-*")
+
+  group = parser.add_mutually_exclusive_group()
+  group.add_argument("--bios", action="store_true",
+                     help="configure for legacy BIOS booting instead of EFI")
+  group.add_argument("--efi", action="store_true", help="configure for EFI")
+
+  return parser
+
+@dataclass
+class Disk:
+  path: str
+  device: str
+  partitions: list
+
+@dataclass
+class Partition:
+  path: str
+  pool: str
+  
+def disk_by_id(path, preferWWN=False):
+  dev = os.path.realpath(path)
+
+  partitions = os.listdir(DISK_BY_ID)
+  match = []
+  for part in partitions:
+    dest = os.readlink(os.path.join(DISK_BY_ID, part))
+    if not os.path.isabs(dest):
+      dest = os.path.join(DISK_BY_ID, dest)
+    dest = os.path.realpath(dest)
+    if dev == dest:
+      match.append(part)
+
+  if match:
+    for part in match:
+      if (part.startswith("wwn-") and preferWWN) \
+         or (not part.startswith("wwn-") and not preferWWN):
+        break
+    return os.path.join(DISK_BY_ID, part)
+
+  return None
+
+def run_command(command, ignore_errors=False):
+  p = subprocess.run(command)
+  if not ignore_errors and p.returncode != 0:
+    print("Failed", command)
+    exit(1)
+  return
+
+def setup_partitions(disk, config_bios, efi_size, boot_size):
+  run_command(["sgdisk", "--zap-all", disk])
+
+  partitions = []
+  if config_bios:
+    run_command(["sgdisk", "-a1", "-n1:24K:+1000K", "-t1:EF02", disk])
+    partitions.append(Partition(f"{disk}-part1", "efibios"))
+  else:
+    run_command(["sgdisk", f"-n2:1M:+{efi_size}", "-t2:EF00", disk])
+    partitions.append(Partition(f"{disk}-part2", "efibios"))
+
+  run_command(["sgdisk", f"-n3:0:+{boot_size}", "-t3:BF01", disk])
+  partitions.append(Partition(f"{disk}-part3", "boot"))
+  run_command(["sgdisk", f"-n4:0:0", "-t4:BF00", disk])
+  partitions.append(Partition(f"{disk}-part4", "main"))
+
+  return partitions
+
+def create_pool(pool_name, mount_point, partitions, mirror_type):
+  run_command(["zpool", "destroy", pool_name], ignore_errors=True)
+  cmd = ["zpool", "create", "-f",
+         "-o", "ashift=12",
+         "-o", "autotrim=on"]
+  if pool_name == "boot":
+    cmd.extend(["-o", "compatibility=grub2",
+                "-o", "cachefile=/etc/zfs/zpool.cache",
+                "-O", "devices=off"])
+  else:
+    cmd.extend(["-O", "dnodesize=auto"])
+
+  cmd.extend(["-O", "acltype=posixacl",
+              "-O", "xattr=sa",
+              "-O", "compression=lz4",
+              "-O", "normalization=formD",
+              "-O", "relatime=on",
+              "-O", "canmount=off",
+              "-O", f"mountpoint={mount_point}",
+              "-R", MNT,
+              pool_name, mirror_type])
+  cmd.extend([x.path for x in partitions])
+
+  run_command(cmd)
+
+  return
+
+def get_partitions(pool_name, partitions):
+  match = []
+  missing = 0
+  for group in partitions:
+    if group is None:
+      missing += 1
+    else:
+      for part in group:
+        if part.pool == pool_name:
+          match.append(part)
+
+  if missing:
+    sizes = []
+    for part in match:
+      cmd = ["blockdev", "--getsize64", part.path]
+      output = subprocess.check_output(cmd)
+      sizes.append(int(output.decode("utf-8")))
+    sparse_size = min(sizes)
+    
+    for idx in range(missing):
+      fake = tempfile.NamedTemporaryFile(dir="/tmp", delete=False)
+      fake.truncate(sparse_size)
+      match.append(Partition(fake.name, pool_name))
+      
+  return match
+
+def offline_missing(partitions):
+  for part in partitions:
+    if part.path.startswith("/tmp/"):
+      run_command(["zpool", "offline", part.pool, part.path])
+      os.unlink(part.path)
+  return
+
+def main():
+  args = build_argparser().parse_args()
+
+  config_bios = not args.efi and (args.bios or not os.path.exists("/sys/firmware/efi"))
+
+  disks = []
+  for path in args.disk:
+    if path == "missing":
+      disks.append(Disk(path, None, None))
+      continue
+
+    real = os.path.realpath(path)
+    if re.search(r"\d+$", real):
+      print("Need disk, not partition:", path)
+      exit(1)
+
+    disk = disk_by_id(path, args.prefer_wwn)
+    if not disk:
+      print("No such disk:", path)
+      exit(1)
+    disks.append(Disk(disk, os.path.realpath(disk), None))
+
+  disks.sort(key=lambda x: x.device if x.device else "")
+
+  for idx in range(len(disks)):
+    if disks[idx].device:
+      first = idx
+      break
+
+  run_command(["umount", "-R", MNT], ignore_errors=True)
+
+  partitions = []
+  for disk in disks:
+    if disk.device is not None:
+      parts = setup_partitions(disk.path, config_bios, args.efi_size, args.boot_size)
+      partitions.append(parts)
+    else:
+      partitions.append(None)
+
+  # FIXME - must sleep and wait for partitions to be seen by kernel?
+  time.sleep(1)
+
+  boot_partitions = get_partitions("boot", partitions)
+  create_pool(args.boot_pool, "/boot", boot_partitions, "mirror")
+  offline_missing(boot_partitions)
+
+  main_partitions = get_partitions("main", partitions)
+  create_pool(args.main_pool, "/", main_partitions, args.raid_level)
+  offline_missing(main_partitions)
+
+  # FIXME - create datasets
+
+  # FIXME - do OS install
+
+  return
+
+if __name__ == '__main__':
+  exit(main() or 0)
