@@ -11,6 +11,7 @@ Packages needed:
 
 * debootstrap
 * gdisk
+* rsync
 * zfs-dkms
 * zfsutils-linux
 

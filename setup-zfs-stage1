@@ -8,6 +8,7 @@ import time
 import tempfile
 import csv
 import shutil
+import pwd
 
 # I found "root" and "boot" were too similar and difficult to
 # disnguish at a glance so I prefer to call the root pool "main"
@@ -278,6 +279,14 @@ def main():
   for path in CONFIG_FILES:
     print("copying", path)
     shutil.copyfile(os.path.join("/", path), os.path.join(MNT, path))
+
+  users = pwd.getpwall()
+  for user in users:
+    home = user.pw_dir
+    dest = os.path.join(MNT, home[1:])
+    if os.path.exists(home) and not os.path.exists(dest):
+      print("Copying home directory for", user.pw_name)
+      run_command(["rsync", "--archive", home, dest])
 
   for path in ["dev", "proc", "sys"]:
     run_command(["mount", "--make-private", "--rbind",
