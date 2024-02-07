@@ -16,6 +16,22 @@ DISK_BY_ID = "/dev/disk/by-id"
 MNT = "/mnt"
 STAGE2_SCRIPT = "setup-zfs-stage2.sh"
 
+# Make sure these do not have leading / otherwise os.path.join will not work
+CONFIG_FILES = [
+  "etc/apt/sources.list",
+  "etc/default/keyboard",
+  "etc/default/locale",
+  "etc/group",
+  "etc/gshadow",
+  "etc/hostid",
+  "etc/hostname",
+  "etc/locale.gen",
+  "etc/network/interfaces",
+  "etc/passwd",
+  "etc/shadow",
+  "etc/timezone",
+]
+
 def build_argparser():
   parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
   parser.add_argument("disk", nargs="+", help="devices to use for disks or missing")
@@ -259,9 +275,7 @@ def main():
     os.mkdir(zfs_config_dir)
   shutil.copy("/etc/zfs/zpool.cache", zfs_config_dir)
 
-  for path in ["etc/apt/sources.list", "etc/locale.gen", "etc/default/locale",
-               "etc/timezone", "etc/default/keyboard", "etc/passwd", "etc/group",
-               "etc/shadow", "etc/gshadow", "etc/hostname"]:
+  for path in CONFIG_FILES:
     print("copying", path)
     shutil.copyfile(os.path.join("/", path), os.path.join(MNT, path))
 

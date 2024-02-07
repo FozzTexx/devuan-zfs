@@ -35,6 +35,13 @@ fi
 apt install --yes openssh-server
 apt install --yes popularity-contest
 
+SHELLS=$(awk -F : '{print $7}' /etc/passwd | sort -u)
+for SHELL in $SHELLS ; do
+    if ! dpkg-query -S "${SHELL}" ; then
+	apt install --yes $(basename "${SHELL}") || true
+    fi
+done
+
 grub-probe /boot
 update-initramfs -c -k all
 
@@ -50,9 +57,8 @@ if [ "${BOOT_TYPE}" = "efi" ] ; then
     grub-install --target=x86_64-efi --efi-directory=/boot/efi \
 		 --bootloader-id=debian --recheck --no-floppy
 else
-    grub-install ${DISK}
+    for DISK in ${DISK_ORDER} ; do
+	grub-install ${DISK}
+    done
 fi
 
-# for DISK in ${DISK_ORDER} ; do
-#     grub-install ${DISK}
-# done
