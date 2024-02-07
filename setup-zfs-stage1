@@ -6,12 +6,15 @@ import subprocess
 from dataclasses import dataclass
 import time
 import tempfile
+import csv
+import shutil
 
 # I found "root" and "boot" were too similar and difficult to
 # disnguish at a glance so I prefer to call the root pool "main"
 
 DISK_BY_ID = "/dev/disk/by-id"
 MNT = "/mnt"
+STAGE2_SCRIPT = "setup-zfs-stage2.sh"
 
 def build_argparser():
   parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -22,6 +25,7 @@ def build_argparser():
   parser.add_argument("--main-pool", default="main", help="name of main pool")
   parser.add_argument("--raid-level", default="raidz2", help="raid level of main pool")
   parser.add_argument("--prefer-wwn", action="store_true", help="prefer /dev/disk/by-id/wwn-*")
+  parser.add_argument("--collection", help="collection name, defaults to hostname")
 
   group = parser.add_mutually_exclusive_group()
   group.add_argument("--bios", action="store_true",
@@ -40,7 +44,7 @@ class Disk:
 class Partition:
   path: str
   pool: str
-  
+
 def disk_by_id(path, preferWWN=False):
   dev = os.path.realpath(path)
 
@@ -50,7 +54,7 @@ def disk_by_id(path, preferWWN=False):
     dest = os.readlink(os.path.join(DISK_BY_ID, part))
     if not os.path.isabs(dest):
       dest = os.path.join(DISK_BY_ID, dest)
-    dest = os.path.realpath(dest)
+      dest = os.path.realpath(dest)
     if dev == dest:
       match.append(part)
 
@@ -64,6 +68,7 @@ def disk_by_id(path, preferWWN=False):
   return None
 
 def run_command(command, ignore_errors=False):
+  print(command)
   p = subprocess.run(command)
   if not ignore_errors and p.returncode != 0:
     print("Failed", command)
@@ -74,22 +79,25 @@ def setup_partitions(disk, config_bios, efi_size, boot_size):
   run_command(["sgdisk", "--zap-all", disk])
 
   partitions = []
+  pnum = 1
   if config_bios:
-    run_command(["sgdisk", "-a1", "-n1:24K:+1000K", "-t1:EF02", disk])
-    partitions.append(Partition(f"{disk}-part1", "efibios"))
+    run_command(["sgdisk", "-a1", f"-n{pnum}:24K:+1000K", f"-t{pnum}:EF02", disk])
+    partitions.append(Partition(f"{disk}-part{pnum}", "efibios"))
   else:
-    run_command(["sgdisk", f"-n2:1M:+{efi_size}", "-t2:EF00", disk])
-    partitions.append(Partition(f"{disk}-part2", "efibios"))
+    run_command(["sgdisk", f"-n{pnum}:1M:+{efi_size}", f"-t{pnum}:EF00", disk])
+    partitions.append(Partition(f"{disk}-part{pnum}", "efibios"))
+  pnum += 1
 
-  run_command(["sgdisk", f"-n3:0:+{boot_size}", "-t3:BF01", disk])
-  partitions.append(Partition(f"{disk}-part3", "boot"))
-  run_command(["sgdisk", f"-n4:0:0", "-t4:BF00", disk])
-  partitions.append(Partition(f"{disk}-part4", "main"))
+  run_command(["sgdisk", f"-n{pnum}:0:+{boot_size}", f"-t{pnum}:BF01", disk])
+  partitions.append(Partition(f"{disk}-part{pnum}", "boot"))
+  pnum += 1
+  run_command(["sgdisk", f"-n{pnum}:0:0", f"-t{pnum}:BF00", disk])
+  partitions.append(Partition(f"{disk}-part{pnum}", "main"))
+  pnum += 1
 
   return partitions
 
 def create_pool(pool_name, mount_point, partitions, mirror_type):
-  run_command(["zpool", "destroy", pool_name], ignore_errors=True)
   cmd = ["zpool", "create", "-f",
          "-o", "ashift=12",
          "-o", "autotrim=on"]
@@ -132,13 +140,13 @@ def get_partitions(pool_name, partitions):
       cmd = ["blockdev", "--getsize64", part.path]
       output = subprocess.check_output(cmd)
       sizes.append(int(output.decode("utf-8")))
-    sparse_size = min(sizes)
-    
+      sparse_size = min(sizes)
+
     for idx in range(missing):
       fake = tempfile.NamedTemporaryFile(dir="/tmp", delete=False)
       fake.truncate(sparse_size)
       match.append(Partition(fake.name, pool_name))
-      
+
   return match
 
 def offline_missing(partitions):
@@ -148,10 +156,20 @@ def offline_missing(partitions):
       os.unlink(part.path)
   return
 
+def create_dataset(dataset_name):
+  run_command(["zfs", "create", "-o", "canmount=off", "-o", "mountpoint=none", dataset_name])
+  return
+
 def main():
   args = build_argparser().parse_args()
+  boot_pool = args.boot_pool
+  main_pool = args.main_pool
 
   config_bios = not args.efi and (args.bios or not os.path.exists("/sys/firmware/efi"))
+
+  with open("/etc/os-release") as f:
+    reader = csv.reader(f, delimiter="=")
+    os_release = dict(reader)
 
   disks = []
   for path in args.disk:
@@ -178,6 +196,8 @@ def main():
       break
 
   run_command(["umount", "-R", MNT], ignore_errors=True)
+  run_command(["zpool", "destroy", boot_pool], ignore_errors=True)
+  run_command(["zpool", "destroy", main_pool], ignore_errors=True)
 
   partitions = []
   for disk in disks:
@@ -191,16 +211,77 @@ def main():
   time.sleep(1)
 
   boot_partitions = get_partitions("boot", partitions)
-  create_pool(args.boot_pool, "/boot", boot_partitions, "mirror")
+  create_pool(boot_pool, "/boot", boot_partitions, "mirror")
   offline_missing(boot_partitions)
 
   main_partitions = get_partitions("main", partitions)
-  create_pool(args.main_pool, "/", main_partitions, args.raid_level)
+  create_pool(main_pool, "/", main_partitions, args.raid_level)
   offline_missing(main_partitions)
 
-  # FIXME - create datasets
+  boot_dset = f"{boot_pool}/{boot_pool.upper()}"
+  create_dataset(boot_dset)
+  main_dset = f"{main_pool}/{main_pool.upper()}"
+  create_dataset(main_dset)
 
-  # FIXME - do OS install
+  collection = args.collection
+  if not collection:
+    collection = os.uname().nodename
+
+  # create filesystems
+
+  run_command(["zfs", "create", "-o", "canmount=noauto", "-o", "mountpoint=/",
+               f"{main_dset}/{collection}"])
+  run_command(["zpool", "set", f"bootfs={main_dset}/{collection}", main_pool])
+  run_command(["zfs", "mount", f"{main_dset}/{collection}"])
+
+  run_command(["zfs", "create", "-o", "mountpoint=/boot", f"{boot_dset}/{collection}"])
+
+  run_command(["zfs", "create", f"{main_pool}/home"])
+  run_command(["zfs", "create", "-o", "mountpoint=/root", f"{main_pool}/home/root"])
+  os.chmod(os.path.join(MNT, "root"), 0o700)
+
+  run_command(["zfs", "create", "-o", "canmount=off", f"{main_pool}/var"])
+  run_command(["zfs", "create", "-o", "canmount=off", f"{main_pool}/var/lib"])
+  run_command(["zfs", "create", f"{main_pool}/var/log"])
+  run_command(["zfs", "create", f"{main_pool}/var/spool"])
+
+  run_command(["zfs", "create", "-o", "com.sun:auto-snapshot=false",
+               f"{main_pool}/var/lib/docker"])
+
+  print("#####################")
+  print("Doing base OS install")
+  print("#####################")
+  print()
+
+  run_command(["debootstrap", os_release['VERSION_CODENAME'], MNT])
+  zfs_config_dir = os.path.join(MNT, "etc/zfs")
+  if not os.path.exists(zfs_config_dir):
+    os.mkdir(zfs_config_dir)
+  shutil.copy("/etc/zfs/zpool.cache", zfs_config_dir)
+
+  for path in ["etc/apt/sources.list", "etc/locale.gen", "etc/default/locale",
+               "etc/timezone", "etc/default/keyboard", "etc/passwd", "etc/group",
+               "etc/shadow", "etc/gshadow", "etc/hostname"]:
+    print("copying", path)
+    shutil.copyfile(os.path.join("/", path), os.path.join(MNT, path))
+
+  for path in ["dev", "proc", "sys"]:
+    run_command(["mount", "--make-private", "--rbind",
+                 os.path.join("/", path), os.path.join(MNT, path)])
+
+  shutil.copy(STAGE2_SCRIPT, os.path.join(MNT, "root"))
+
+  disk_order = " ".join([x.path for x in disks if x.device])
+  efibios = "bios" if config_bios else "efi"
+  run_command(["chroot", MNT, "/usr/bin/env",
+               "TERM=vt100",
+               f"DISK_ORDER={disk_order}",
+               f"FIRST={disks[first].path}",
+               f"DSET_MAIN={main_dset}",
+               f"POOL_BOOT={boot_pool}",
+               f"POOL_MAIN={main_pool}",
+               f"BOOT_TYPE={efibios}",
+               os.path.join("/root", STAGE2_SCRIPT)])
 
   return
 

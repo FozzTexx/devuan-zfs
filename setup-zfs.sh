@@ -9,8 +9,8 @@ MNT=/mnt
 
 umount -R ${MNT} || true
 
-FIRST=ZSNL
-DISKS=$(ls /dev/disk/by-id/ata-ST18000NM000J* | grep -v -e '-part[0-9]*$')
+FIRST=ZA160V3A
+DISKS=$(ls /dev/disk/by-id/ata-ST8000* | grep -v -e '-part[0-9]*$')
 
 for DISK in ${DISKS} ; do
     if echo ${DISK} | grep -q ${FIRST} ; then

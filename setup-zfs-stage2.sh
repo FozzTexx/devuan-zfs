@@ -14,19 +14,23 @@ apt install --yes zfs-initramfs
 
 echo REMAKE_INITRD=yes > /etc/dkms/zfs.conf
 
-apt install dosfstools
+if [ "${BOOT_TYPE}" = "efi" ] ; then
+    apt install dosfstools
 
-mkdosfs -F 32 -s 1 -n EFI ${DISK}-part2
-mkdir /boot/efi
-DISK_UUID=/dev/disk/by-uuid/$(blkid -s UUID -o value ${DISK}-part2)
-echo DISK: ${DISK_UUID}
-while [ ! -e ${DISK_UUID} ] ; do
-    ls -Fla /dev/disk/by-uuid
-    sleep 1
-done
-echo ${DISK_UUID} /boot/efi vfat defaults 0 0 >> /etc/fstab
-mount /boot/efi
-apt install --yes grub-efi-amd64 shim-signed
+    mkdosfs -F 32 -s 1 -n EFI ${DISK}-part2
+    mkdir /boot/efi
+    DISK_UUID=/dev/disk/by-uuid/$(blkid -s UUID -o value ${DISK}-part2)
+    echo DISK: ${DISK_UUID}
+    while [ ! -e ${DISK_UUID} ] ; do
+	ls -Fla /dev/disk/by-uuid
+	sleep 1
+    done
+    echo ${DISK_UUID} /boot/efi vfat defaults 0 0 >> /etc/fstab
+    mount /boot/efi
+    apt install --yes grub-efi-amd64 shim-signed
+else
+    apt install --yes grub-pc
+fi
 
 apt install --yes openssh-server
 apt install --yes popularity-contest
@@ -40,9 +44,14 @@ sed -i \
     -e 's/"quiet"/""/' \
     /etc/default/grub
 
+apt purge --yes os-prober
 update-grub
-grub-install --target=x86_64-efi --efi-directory=/boot/efi \
-    --bootloader-id=debian --recheck --no-floppy
+if [ "${BOOT_TYPE}" = "efi" ] ; then
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+		 --bootloader-id=debian --recheck --no-floppy
+else
+    grub-install ${DISK}
+fi
 
 # for DISK in ${DISK_ORDER} ; do
 #     grub-install ${DISK}
