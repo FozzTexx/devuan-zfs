@@ -286,7 +286,7 @@ def main():
     dest = os.path.join(MNT, home[1:])
     if os.path.exists(home) and not os.path.exists(dest):
       print("Copying home directory for", user.pw_name)
-      run_command(["rsync", "--archive", home, os.path.dirname(dest)])
+      run_command(["rsync", "--archive", home, os.path.join(os.path.dirname(dest), ".")])
 
   for path in ["dev", "proc", "sys"]:
     run_command(["mount", "--make-private", "--rbind",
