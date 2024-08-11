@@ -15,5 +15,5 @@ Packages needed:
 * zfs-dkms
 * zfsutils-linux
 
-Run setup-zfs.sh, setup-zfs-stage2.sh will be run from inside the chroot by setup-zfs.sh
+Run setup-zfs-stage1, setup-zfs-stage2.sh will be run from inside the chroot by setup-zfs-stage1
 

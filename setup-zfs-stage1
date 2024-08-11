@@ -92,7 +92,7 @@ def run_command(command, ignore_errors=False):
     exit(1)
   return
 
-def setup_partitions(disk, config_bios, efi_size, boot_size):
+def setup_partitions(disk, config_bios, efi_size, boot_size, boot_pool, main_pool):
   run_command(["sgdisk", "--zap-all", disk])
 
   partitions = []
@@ -106,19 +106,19 @@ def setup_partitions(disk, config_bios, efi_size, boot_size):
   pnum += 1
 
   run_command(["sgdisk", f"-n{pnum}:0:+{boot_size}", f"-t{pnum}:BF01", disk])
-  partitions.append(Partition(f"{disk}-part{pnum}", "boot"))
+  partitions.append(Partition(f"{disk}-part{pnum}", boot_pool))
   pnum += 1
   run_command(["sgdisk", f"-n{pnum}:0:0", f"-t{pnum}:BF00", disk])
-  partitions.append(Partition(f"{disk}-part{pnum}", "main"))
+  partitions.append(Partition(f"{disk}-part{pnum}", main_pool))
   pnum += 1
 
   return partitions
 
-def create_pool(pool_name, mount_point, partitions, mirror_type):
+def create_pool(pool_name, mount_point, partitions, mirror_type, isBoot):
   cmd = ["zpool", "create", "-f",
          "-o", "ashift=12",
          "-o", "autotrim=on"]
-  if pool_name == "boot":
+  if isBoot:
     cmd.extend(["-o", "compatibility=grub2",
                 "-o", "cachefile=/etc/zfs/zpool.cache",
                 "-O", "devices=off"])
@@ -157,8 +157,8 @@ def get_partitions(pool_name, partitions):
       cmd = ["blockdev", "--getsize64", part.path]
       output = subprocess.check_output(cmd)
       sizes.append(int(output.decode("utf-8")))
-      sparse_size = min(sizes)
 
+    sparse_size = min(sizes)
     for idx in range(missing):
       fake = tempfile.NamedTemporaryFile(dir="/tmp", delete=False)
       fake.truncate(sparse_size)
@@ -219,7 +219,8 @@ def main():
   partitions = []
   for disk in disks:
     if disk.device is not None:
-      parts = setup_partitions(disk.path, config_bios, args.efi_size, args.boot_size)
+      parts = setup_partitions(disk.path, config_bios, args.efi_size, args.boot_size,
+                               boot_pool, main_pool)
       partitions.append(parts)
     else:
       partitions.append(None)
@@ -227,12 +228,12 @@ def main():
   # FIXME - must sleep and wait for partitions to be seen by kernel?
   time.sleep(1)
 
-  boot_partitions = get_partitions("boot", partitions)
-  create_pool(boot_pool, "/boot", boot_partitions, "mirror")
+  boot_partitions = get_partitions(boot_pool, partitions)
+  create_pool(boot_pool, "/boot", boot_partitions, "mirror", isBoot=True)
   offline_missing(boot_partitions)
 
-  main_partitions = get_partitions("main", partitions)
-  create_pool(main_pool, "/", main_partitions, args.raid_level)
+  main_partitions = get_partitions(main_pool, partitions)
+  create_pool(main_pool, "/", main_partitions, args.raid_level, isBoot=False)
   offline_missing(main_partitions)
 
   boot_dset = f"{boot_pool}/{boot_pool.upper()}"
